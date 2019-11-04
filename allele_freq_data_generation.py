@@ -15,6 +15,7 @@ import multiprocessing as mp
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Embedding, Dropout, Lambda, Masking
 from tensorflow.keras.layers import LSTM
+import tensorflow_probability as tfp
 import argparse
 import os
 
@@ -24,8 +25,10 @@ parser = argparse.ArgumentParser(
         description='',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--load', help = 'load the model from a file')
+parser.add_argument('--evaluate', action='store_true')
 args = parser.parse_args()
 
+tf.enable_eager_execution()
 
 # # generating data for demographic inference with RNNs
 # 
@@ -75,7 +78,6 @@ def brownian_motion(x0, ts, sigma2):
     return x
 
 time_midpoints = time_boundaries[:-1] + (time_boundaries[1:] - time_boundaries[:-1])/2.0
-#time_midpoints = np.concatenate(([0], time_midpoints))
 num_pop_sizes = time_midpoints.shape[0]
 
 data_queue = mp.Queue(256)
@@ -83,12 +85,7 @@ data_queue = mp.Queue(256)
 num_data_threads = 12
 
 sample_size = 1000
-#mutation_rate = 1000
-#recombination_rate = 1000
-#to_keep = 500
 
-#chromosome_length = 1e8  # 100 Megabases
-#chromosome_length = 1e7  # 10 Megabases
 chromosome_length = 1e6  # 1 Megabase
 position_mean = chromosome_length/2.0
 position_std = np.sqrt(1.0/12)*chromosome_length
@@ -100,46 +97,10 @@ upper_recombination_rate = 1e-8*1e4
 
 mutations_per_tree = 1
 
-# calibration_afs = []
-# for i in range(100):
-#     pop_sizes = np.exp(brownian_motion(0.0, time_midpoints, 1))
-#     demo_events = [
-#         msprime.PopulationParametersChange(t, size)
-#         for t, size in zip(time_midpoints, pop_sizes)]
-#     mutation_rate = 10**npr.uniform(np.log10(lower_mutation_rate),
-#                                 np.log10(upper_mutation_rate))
-#     trees = msprime.simulate(sample_size=sample_size,
-#                              Ne=1,
-#                              length=chromosome_length,
-#                              num_replicates=10,
-#                              mutation_rate=mutation_rate)
-#     for j, tree in enumerate(trees):
-#         calibration_afs.extend(list(tree.genotype_matrix().sum(1) /
-#                                     sample_size))
-#         print(i, j)
-# print(np.mean(calibration_afs), np.std(calibration_afs))
-# import pdb; pdb.set_trace()
-
 af_mean = 0.1334
 af_std = 0.2227
 
-def produce_data(queue, thread_id, sample_size, mutation_rate, recombination_rate, time_midpoints, to_keep):
-    npr.seed(thread_id*os.getpid())
-    while True:
-        pop_sizes = np.exp(brownian_motion(0.0, time_midpoints, 1))
-        demo_events = [msprime.PopulationParametersChange(t, size) for t, size in zip(time_midpoints, pop_sizes)]
-        trees = msprime.simulate(sample_size=sample_size,
-                                 Ne=1,
-                                 length=1,
-                                 recombination_rate=1000,
-                                 mutation_rate=1000)
-        gens = trees.genotype_matrix()
-        afs = gens.sum(1)/sample_size
-        positions = [var.site.position for var in trees.variants()]
-        tdat = np.transpose(np.vstack((afs[:to_keep], positions[:to_keep])))
-        queue.put((tdat, pop_sizes))
-
-def produce_data_2(
+def produce_data(
         queue,
         thread_id,
         sample_size,
@@ -176,7 +137,7 @@ def produce_data_2(
             queue.put((tdat, pop_sizes))
 
 data_processes = [
-    mp.Process(target=produce_data_2,
+    mp.Process(target=produce_data,
                args=(
                    data_queue,
                    tid,
@@ -210,113 +171,46 @@ dataset = dataset.padded_batch(batch_size, ((tf.compat.v1.Dimension(None),
                                     tf.compat.v1.Dimension(2)),
                                     tf.compat.v1.Dimension(num_pop_sizes)))
 
-diter = dataset.make_one_shot_iterator()
-dnext = diter.get_next()
-with tf.Session() as sess:
-    afs, trajs = sess.run(dnext)
-
 if args.load is not None:
-    model = tf.keras.models.load_model(args.load_model)
+    model = tf.keras.models.load_model(args.load)
 else:
     model = Sequential()
     model.add(Masking(mask_value=0))
     model.add(LSTM(128, input_shape=(None,2)))
     model.add(Dense(2*num_pop_sizes))
     model.add(Lambda(lambda x: x*x))
+    model.add(tfp.layers.DistributionLambda(
+        lambda t: tfp.distributions.Gamma(
+            concentration=t[:,:num_pop_sizes]**2/t[:,num_pop_sizes:]+1e-5,
+            rate=t[:,:num_pop_sizes]/t[:,num_pop_sizes:]+1e-5)))
+    # Note on concentrations and rates [the NN outputs means (m) and
+    # variances(v)]:
+    # m = c/r
+    # v = c/r^2
+    # r = m/v
+    # c = m*r = m*m/v
 
 
-def gamma_mse_loss(y_true, y_pred):
-    '''
-    E[(X-a)^2] = E[X^2] - 2aE[X] + a^2
 
-    E[X^2] = Var[X] + E[X]^2
+negloglik = lambda y, p_y: -tf.math.reduce_sum(p_y.log_prob(y))
 
-    Note: To get around the annoying fact that y_true and y_pred have to be the
-    same dimension, we pad y_true with an extra complement of zeros. The first
-    num_pop_sizes are the true population sizes, and the second num_pop_sizes
-    are just zero padding.
-
-    (I thought we'd have to do this, but it turns out the requirement for
-    y_true and y_pred having the same shape doesn't seem to hold.)
-
-    Initially was parameterizing with gamma distribution parameters, but
-    hitting a "mean" with that requires coordinating two outputs.
-    Reparameterizing with mean and var/mean, which should be easier to fit.
-    '''
-    #shapes = y_pred[:,:num_pop_sizes]
-    #scales = y_pred[:,num_pop_sizes:]
-    #means = shapes*scales
-    #variances = means*scales
-    y_true = tf.keras.backend.print_tensor(y_true, 'y_true: ')
-    #y_pred = tf.keras.backend.print_tensor(y_pred, 'y_pred: ')
-
-    means = y_pred[:,:num_pop_sizes]
-    means = tf.keras.backend.print_tensor(means, "means: ")
-    var_over_means = y_pred[:,num_pop_sizes:]
-    variances = var_over_means * means
-    variances = tf.keras.backend.print_tensor(variances, "variances: ")
-    second_moments = variances + means*means
-    #second_moments = tf.keras.backend.print_tensor(second_moments, "second_moments: ")
-
-
-    mses = (second_moments - 2*y_true*means + y_true*y_true)
-    # Note, to try: try normalizing the MSE by the variance or SD.
-    ret = tf.keras.backend.print_tensor(tf.reduce_sum(mses, axis=1),
-                                        'loss values: ')
-    return ret
-
-
-def norm_mse_loss(y_true, y_pred):
-    '''
-    E[(X-a)^2] = E[X^2] - 2aE[X] + a^2
-
-    E[X^2] = Var[X] + E[X]^2
-
-    Note: To get around the annoying fact that y_true and y_pred have to be the
-    same dimension, we pad y_true with an extra complement of zeros. The first
-    num_pop_sizes are the true population sizes, and the second num_pop_sizes
-    are just zero padding.
-
-    (I thought we'd have to do this, but it turns out the requirement for
-    y_true and y_pred having the same shape doesn't seem to hold.)
-
-    Initially was parameterizing with gamma distribution parameters, but
-    hitting a "mean" with that requires coordinating two outputs.
-    Reparameterizing with mean and var/mean, which should be easier to fit.
-    '''
-    #y_true = tf.keras.backend.print_tensor(y_true, 'y_true: ')
-
-    means = y_pred[:,:num_pop_sizes]
-    #means = tf.keras.backend.print_tensor(means, "means: ")
-
-    mses = (y_true - means)**2 / y_true
-    #mses = tf.keras.backend.print_tensor(mses, 'mses: ')
-    ret = tf.reduce_sum(mses, axis=1)
-    #ret = tf.keras.backend.print_tensor(ret, 'loss values: ')
-    return ret
-
-
-#optimizer = tf.keras.optimizers.SGD(lr=0.0001, momentum=0.0001)
 optimizer = tf.keras.optimizers.Adam()
-#model.compile(loss=gamma_mse_loss, optimizer=optimizer)
-model.compile(loss=norm_mse_loss, optimizer=optimizer)
+model.compile(loss=negloglik, optimizer=optimizer)
+
+if args.evaluate:
+    while True:
+        tdat, pop_sizes = data_generator().next()
+        tdat = tdat[np.newaxis,:,:].astype(np.float32)
+        mean = model(tdat).mean()
+        std = np.sqrt(model(tdat).variance())
+        out = pd.DataFrame({'true': pop_sizes, 'predicted': mean[0],
+                            'std': std[0]})
+        print(out)
+        import pdb; pdb.set_trace()
+
 checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-    'test.model',load_weights_on_restart=True)
-#tensorboard_callback = tf.keras.callbacks.Tensorboard('log/'
-num_epochs = 100
+    'tfp_gamma_fixed_loss.model',load_weights_on_restart=True)
+num_epochs = 10000
 batches_per_epoch = 100
 model.fit(dataset, epochs=num_epochs, steps_per_epoch=batches_per_epoch,
           callbacks=[checkpoint_callback])
-
-#model.predict(dataset.batch(16))
-diter = dataset.make_one_shot_iterator()
-dnext = diter.get_next()
-with tf.Session() as sess:
-    afs, trajs = sess.run(dnext)
-prediction = model.predict(np.array([afs[0]]))
-true_traj = trajs[0]
-print(prediction)
-print(true_traj)
-
-for p in data_processes:
-    p.terminate()
